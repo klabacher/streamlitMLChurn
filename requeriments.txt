@@ -1,0 +1,9 @@
+streamlit
+pandas
+joblib
+scikit-learn==1.6.1
+openpyxl
+xlsxwriter
+imblearn
+catboost==1.2.8
+plotly
