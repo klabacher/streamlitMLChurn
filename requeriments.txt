@@ -7,3 +7,4 @@ xlsxwriter
 imblearn
 catboost==1.2.8
 plotly
+joblib==1.5.2
