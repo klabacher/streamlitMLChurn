@@ -222,7 +222,7 @@ def read_any_table(uploaded_file) -> pd.DataFrame | None:
 # ---------------------------
 # Interface
 # ---------------------------
-st.title("🧠 Plataforma de Previsão de Reversão (Deploy Alinhado)")
+st.title("🧠 Plataforma de Previsão de Reversão (TMB - Churn)")
 
 st.markdown(
     """
