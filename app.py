@@ -1,246 +1,368 @@
-import streamlit as st
-import pandas as pd
+
+import io
+import re
+from datetime import datetime
+
 import joblib
 import numpy as np
-from datetime import datetime
-import io
-import plotly.express as px  # NOVO: Importando a biblioteca para gráficos
+import pandas as pd
+import streamlit as st
 
-# --- Configuração Inicial da Página ---
+# ============================================================
+#  APP DE INFERÊNCIA — 100% ALINHADO AO NOTEBOOK DE TREINAMENTO
+#  Objetivo: prever "Revertido" (0 = não reverte, 1 = reverte)
+#  Features usadas NO TREINO (exatamente estas, nesta ordem):
+#    ['Estado', 'Ticket (R$)', 'Modalidade de Contrato',
+#     'dias_ativo', 'mes_efetivacao', 'dia_semana_efetivacao']
+#  Observação: colunas como "Prazo", "Motivo de cancelamento",
+#  "Status Financeiro" e meta_* NÃO foram usadas no treino.
+#  Portanto, NÃO entram no modelo nesta versão.
+# ============================================================
+
 st.set_page_config(
-    page_title="Plataforma de Previsão de Reversão",
-    page_icon="🤖",
-    layout="wide"
+    page_title="Previsão de Reversão — Alinhado ao Treino",
+    page_icon="🧠",
+    layout="wide",
 )
 
-# --- CARREGAMENTO DO MODELO (HARDCODED) ---
-NOME_ARQUIVO_MODELO = "modelo_v1.pkl"
+MODEL_PATH = "melhor_modelo_corrigido.pkl"
 
-@st.cache_resource
-def carregar_modelo(caminho_modelo):
+# Colunas mínimas que o arquivo deve ter para conseguirmos construir as features do modelo
+REQUIRED_RAW_COLS = [
+    "Data Efetivado",
+    "Ticket (R$)",
+    "Estado",
+    "Modalidade de Contrato",
+]
+
+# Exatamente as colunas que alimentam o pipeline salvo no notebook
+FEATURES_FOR_MODEL = [
+    "Estado",
+    "Ticket (R$)",
+    "Modalidade de Contrato",
+    "dias_ativo",
+    "mes_efetivacao",
+    "dia_semana_efetivacao",
+]
+
+
+# ---------------------------
+# Utilidades
+# ---------------------------
+def _clean_money_to_float(series: pd.Series) -> pd.Series:
+    """
+    Converte coluna com valores monetários brasileiros para float.
+    Exemplos de entradas válidas: 'R$ 1.234,56', '1234,56', '1.234', 1234.56 etc.
+    """
+    s = series.astype(str).str.strip()
+    s = (
+        s.str.replace(r"[R$\s]", "", regex=True)  # remove R$ e espaços
+         .str.replace(".", "", regex=False)       # remove separador de milhar
+         .str.replace(",", ".", regex=False)      # troca decimal
+    )
+    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _make_tz_naive(dt_series: pd.Series) -> pd.Series:
+    """
+    Garante que a série datetime fique **tz-naive** (sem timezone).
+    Funciona tanto para entradas tz-aware quanto tz-naive.
+    """
     try:
-        modelo = joblib.load(caminho_modelo)
-        return modelo
+        # Se for tz-aware, converte para "sem tz"
+        return dt_series.dt.tz_convert(None)
+    except Exception:
+        try:
+            return dt_series.dt.tz_localize(None)
+        except Exception:
+            return dt_series
+
+
+def _compute_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    A partir de 'Data Efetivado', cria:
+      - dias_ativo (agora - Data Efetivado)
+      - mes_efetivacao
+      - dia_semana_efetivacao (0=Seg ... 6=Dom)
+    """
+    # Tenta parse considerando formato BR primeiro; se falhar, tenta ISO
+    dt = pd.to_datetime(df["Data Efetivado"], errors="coerce", dayfirst=True, infer_datetime_format=True)
+    if dt.isna().any():
+        # Tenta novamente sem dayfirst (casos raros), antes de imputar
+        dt2 = pd.to_datetime(df.loc[dt.isna(), "Data Efetivado"], errors="coerce", dayfirst=False, infer_datetime_format=True)
+        dt.loc[dt.isna()] = dt2
+
+    # Força a série para tz-naive (remove qualquer timezone)
+    dt = _make_tz_naive(dt)
+
+    # Imputação de datas inválidas com mediana
+    if dt.isna().any():
+        if dt.notna().any():
+            mediana = dt[dt.notna()].median()
+        else:
+            # caso extremo: se TODAS as datas forem inválidas, define mediana = hoje (naive)
+            mediana = pd.Timestamp(datetime.now())
+        dt = dt.fillna(mediana)
+
+    # Usa 'now' tz-naive para evitar erro "tz-naive vs tz-aware"
+    now = pd.Timestamp(datetime.now())
+    df["dias_ativo"] = (now - dt).dt.days.clip(lower=0).astype(int)
+    df["mes_efetivacao"] = dt.dt.month.astype(int)
+    df["dia_semana_efetivacao"] = dt.dt.dayofweek.astype(int)
+    return df
+
+
+def _ensure_minimum_schema(df: pd.DataFrame) -> None:
+    """Gera erro claro caso as colunas mínimas não estejam presentes."""
+    cols = [c.strip() for c in df.columns]
+    raw = set(cols)
+    missing = [c for c in REQUIRED_RAW_COLS if c not in raw]
+    if missing:
+        raise ValueError(
+            "Arquivo não possui as colunas mínimas obrigatórias: "
+            + ", ".join(f"`{c}`" for c in missing)
+        )
+
+
+def _prepare_dataframe_for_model(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Normaliza, valida e cria exatamente as features esperadas pelo modelo treinado.
+    Retorna (df_model, avisos).
+    """
+    avisos: list[str] = []
+
+    # Normaliza nomes (tira espaços extras nas pontas)
+    df = df_raw.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    # Valida colunas mínimas
+    _ensure_minimum_schema(df)
+
+    # Tipos/correções básicas
+    # Estado e Modalidade — strings, preenchendo desconhecidos
+    for col in ["Estado", "Modalidade de Contrato"]:
+        if col not in df.columns:
+            df[col] = "Desconhecido"
+            avisos.append(f"Coluna ausente '{col}' criada com 'Desconhecido'.")
+        df[col] = df[col].astype(str).replace({"": "Desconhecido"})
+
+    # Ticket (R$) — monetário → float; nulos → mediana
+    if "Ticket (R$)" in df.columns:
+        df["Ticket (R$)"] = _clean_money_to_float(df["Ticket (R$)"])
+        if df["Ticket (R$)"].isna().any():
+            med = float(np.nanmedian(df["Ticket (R$)"]))
+            df["Ticket (R$)"] = df["Ticket (R$)"].fillna(med)
+            avisos.append(f"Valores nulos em 'Ticket (R$)' preenchidos com a mediana ({med:.2f}).")
+    else:
+        # Cria e preenche com zero; será avisado
+        df["Ticket (R$)"] = 0.0
+        avisos.append("Coluna 'Ticket (R$)' ausente — criada com 0.0 (verifique o arquivo).")
+
+    # Datas → features temporais
+    if "Data Efetivado" not in df.columns:
+        # cria coluna vazia e deixa _compute_time_features imputar
+        df["Data Efetivado"] = pd.NaT
+        avisos.append("Coluna 'Data Efetivado' ausente — dias_ativo/mes/dia_semana imputados a partir de mediana.")
+    df = _compute_time_features(df)
+
+    # Seleciona e reordena EXATAMENTE as features que o modelo conhece
+    df_model = df[FEATURES_FOR_MODEL].copy()
+
+    # Sanity check final de tipos
+    # Numéricos esperados:
+    numeric_expected = ["Ticket (R$)", "dias_ativo", "mes_efetivacao", "dia_semana_efetivacao"]
+    for col in numeric_expected:
+        if not pd.api.types.is_numeric_dtype(df_model[col]):
+            try:
+                df_model[col] = pd.to_numeric(df_model[col], errors="coerce")
+            except Exception:
+                pass
+            if df_model[col].isna().any():
+                med = float(np.nanmedian(df_model[col]))
+                df_model[col] = df_model[col].fillna(med)
+
+    # Categóricas esperadas:
+    for col in ["Estado", "Modalidade de Contrato"]:
+        df_model[col] = df_model[col].astype(str)
+
+    return df_model, avisos
+
+
+@st.cache_resource(show_spinner=False)
+def load_model(model_path: str):
+    try:
+        mdl = joblib.load(model_path)
     except FileNotFoundError:
+        return None, "Arquivo de modelo não encontrado."
+    except Exception as e:
+        return None, f"Falha ao carregar o modelo: {e}"
+    return mdl, None
+
+
+@st.cache_data(show_spinner=False)
+def read_any_table(uploaded_file) -> pd.DataFrame | None:
+    """
+    Lê CSV/Excel com heurística robusta (Excel com múltiplas abas = concat).
+    """
+    name = uploaded_file.name.lower()
+    try:
+        if name.endswith(".csv"):
+            # sep=None => sniff do separador (ponto e vírgula, vírgula, etc.)
+            return pd.read_csv(uploaded_file, sep=None, engine="python")
+        elif name.endswith(".xlsx") or name.endswith(".xls"):
+            xl = pd.ExcelFile(uploaded_file)
+            dfs = [pd.read_excel(xl, sh) for sh in xl.sheet_names]
+            return pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+    except Exception:
         return None
-
-modelo = carregar_modelo(NOME_ARQUIVO_MODELO)
-
-# --- LISTA DE COLUNAS CRÍTICAS ---
-# Usada para validação e para mostrar ao usuário
-COLUNAS_CRITICAS_BASE = [
-    'Prazo', 'Produtor', 'Produto', 'Estado', 'Status Financeiro',
-    'Ticket (R$)', 'Modalidade de Contrato', 'Data Efetivado'
-]
-
-COLUNAS_CRITICAS = [
-    'Prazo', 'Produtor', 'Produto', 'Estado', 'Status Financeiro',
-    'Ticket (R$)', 'Modalidade de Contrato', 'dias_ativo',
-    'mes_efetivacao', 'dia_semana_efetivacao'
-]
-
-# --- Funções de Processamento ---
-
-def carregar_dados(uploaded_file):
-    df = None
-    if uploaded_file.name.endswith('.csv'):
-        try:
-            df = pd.read_csv(uploaded_file, sep=None, engine='python')
-            st.success(f"✅ Arquivo CSV **{uploaded_file.name}** carregado!")
-            return df
-        except Exception as e:
-            st.error(f"❌ Erro ao ler o arquivo CSV. Detalhe: {e}")
-            return None
-    elif uploaded_file.name.endswith(('.xls', '.xlsx')):
-        try:
-            xls = pd.ExcelFile(uploaded_file)
-            sheet_names = xls.sheet_names
-            if len(sheet_names) > 1:
-                option = st.selectbox("Selecione a aba do Excel para usar:", ["**Processar Todas as Abas**"] + sheet_names)
-                if option == "**Processar Todas as Abas**":
-                    df_list = [pd.read_excel(xls, sheet_name=name) for name in sheet_names]
-                    df = pd.concat(df_list, ignore_index=True)
-                    st.success(f"✅ Todas as {len(sheet_names)} abas foram combinadas!")
-                else:
-                    df = pd.read_excel(xls, sheet_name=option)
-                    st.success(f"✅ Aba **'{option}'** carregada!")
-            else:
-                df = pd.read_excel(xls)
-                st.success(f"✅ Arquivo Excel **{uploaded_file.name}** carregado!")
-            return df
-        except Exception as e:
-            st.error(f"❌ Erro ao ler o arquivo Excel. Detalhe: {e}")
-            return None
     return None
 
-def preparar_dados_robusto(df_original):
-    df = df_original.copy()
-    colunas_presentes = df.columns.tolist()
-    avisos = []
 
-    if ' Ticket (R$) ' in colunas_presentes:
-        df.rename(columns={' Ticket (R$) ': 'Ticket (R$)'}, inplace=True)
+# ---------------------------
+# Interface
+# ---------------------------
+st.title("🧠 Plataforma de Previsão de Reversão (Deploy Alinhado)")
 
-    colunas_data = ['Criado Em', 'Data Efetivado']
-    for col in colunas_data:
-        if col in colunas_presentes:
-            df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
+st.markdown(
+    """
+**Como funciona:** Este app reproduz **exatamente** as features do notebook de treinamento.  
+As colunas necessárias do arquivo de entrada são:
+- `Data Efetivado` (data)
+- `Ticket (R$)` (valor monetário)
+- `Estado` (UF)
+- `Modalidade de Contrato` (categórica)
+"""
+)
 
-    if 'Data Efetivado' in df.columns and pd.api.types.is_datetime64_any_dtype(df['Data Efetivado']):
-        df['dias_ativo'] = (datetime.now() - df['Data Efetivado']).dt.days
-        df['mes_efetivacao'] = df['Data Efetivado'].dt.month
-        df['dia_semana_efetivacao'] = df['Data Efetivado'].dt.dayofweek
-    else:
-        avisos.append("Aviso: Features de data ('dias_ativo', etc.) não puderam ser geradas. Verifique a coluna 'Data Efetivado'.")
-
-    # Bloco de verificação de colunas críticas
-    colunas_processadas = df.columns.tolist()
-    colunas_faltantes = [col for col in COLUNAS_CRITICAS if col not in colunas_processadas]
-    if colunas_faltantes:
-        mensagem_erro = f"O arquivo enviado não pode ser processado. As seguintes colunas obrigatórias não foram encontradas após o processamento inicial: **{', '.join(colunas_faltantes)}**"
-        raise ValueError(mensagem_erro)
-
-    # O pré-processamento continua APÓS a validação
-    if 'Ticket (R$)' in df.columns:
-        try:
-            df['Ticket (R$)'] = df['Ticket (R$)'].astype(str).str.replace('R$ ', '', regex=False).str.replace('.', '', regex=False).str.replace(',', '.', regex=False).astype(float)
-        except (AttributeError, ValueError): pass
-
-    return df, avisos
-
-# --- Interface do Streamlit ---
-
-st.title("🤖 Plataforma de Análise e Previsão de Reversão")
-
-if modelo is None:
-    st.error(f"❌ **ERRO CRÍTICO:** O arquivo do modelo (`{NOME_ARQUIVO_MODELO}`) não foi encontrado.")
+model, err = load_model(MODEL_PATH)
+if model is None:
+    st.error(f"❌ Não foi possível carregar o modelo `{MODEL_PATH}`. {err or ''}")
     st.stop()
 
-# NOVO: Seção de instruções sobre as colunas necessárias
-with st.expander("⚠️ Clique aqui para ver as colunas necessárias no seu arquivo"):
-    st.info("Para que o modelo funcione corretamente, seu arquivo CSV ou Excel precisa conter as seguintes colunas. A ordem não importa, mas os nomes devem ser idênticos.")
-    
-    # Exibe as colunas em um formato de lista para melhor visualização
-    cols_html = "".join([f"<li><code>{col}</code></li>" for col in COLUNAS_CRITICAS_BASE])
-    st.markdown(f"<ul>{cols_html}</ul>", unsafe_allow_html=True)
-    
-st.markdown("---")
+with st.sidebar:
+    st.markdown("### ⚙️ Configurações de Predição")
+    threshold = st.slider(
+        "Limiar (threshold) para classificar como **Vai reverter (classe 1)**",
+        min_value=0.05, max_value=0.95, value=0.50, step=0.01,
+        help=(
+            "Em bases desbalanceadas, um limiar ≠ 0.50 pode melhorar o recall/precisão. "
+            "Use este controle para ajustar a sensibilidade."
+        ),
+    )
+    st.divider()
+    st.markdown("### 📄 Baixe um template de entrada")
+    template = pd.DataFrame(
+        {c: [] for c in REQUIRED_RAW_COLS}
+    )
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
+        template.to_excel(w, index=False, sheet_name="Template")
+    st.download_button("📥 Template (.xlsx)", data=out.getvalue(),
+                       file_name="template_previsao.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# --- Passo 1: Upload do Arquivo de Dados ---
-st.header("Passo 1: Carregue o arquivo de dados")
-uploaded_data_file = st.file_uploader("Selecione o arquivo CSV ou Excel", type=["csv", "xlsx", "xls"])
+st.header("1) Envie seu arquivo de dados")
+file = st.file_uploader("CSV ou Excel (.csv, .xlsx, .xls)", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
 
 df_raw = None
-if uploaded_data_file:
-    df_raw = carregar_dados(uploaded_data_file)
-    if df_raw is not None:
-        st.write(f"Resumo: **{df_raw.shape[0]}** linhas e **{df_raw.shape[1]}** colunas.")
+if file:
+    df_raw = read_any_table(file)
+    if df_raw is None or df_raw.empty:
+        st.error("❌ Não consegui ler o arquivo. Verifique o formato/codificação.")
+        st.stop()
+    st.success(f"✅ Arquivo lido — {df_raw.shape[0]} linhas × {df_raw.shape[1]} colunas.")
+    with st.expander("🔎 Visualizar amostra dos dados", expanded=False):
+        st.dataframe(df_raw.head(20))
 
-# --- Passo 2: Processamento e Previsão ---
-st.header("Passo 2: Realizar as Previsões")
+st.header("2) Processar e Prever")
+btn = st.button("🚀 Executar previsão", type="primary", use_container_width=True)
 
-if st.button("Executar Previsão", type="primary", use_container_width=True):
-    if df_raw is None:
-        st.error("❌ **Ação necessária:** Por favor, carregue um arquivo de dados válido no Passo 1.")
-    else:
-        with st.spinner('Aguarde... Processando dados e realizando previsões...'):
-            try:
-                df_processed, avisos = preparar_dados_robusto(df_raw.copy())
-                
-                previsoes = modelo.predict(df_processed)
-                probabilidades = modelo.predict_proba(df_processed)[:, 1]
+if btn:
+    try:
+        if df_raw is None:
+            st.warning("Envie um arquivo primeiro.")
+            st.stop()
 
-                df_resultados = df_raw.copy()
-                df_resultados['Previsão'] = ["Vai reverter" if p == 1 else "Não vai reverter" for p in previsoes]
-                # NOVO: Mantém a probabilidade numérica para os gráficos
-                df_resultados['Probabilidade_numerica'] = probabilidades
-                # Cria a coluna formatada para exibição
-                df_resultados['Probabilidade de Reversão'] = df_resultados['Probabilidade_numerica'].apply(lambda p: f"{p * 100:.1f}%")
-                
-                st.success("✅ Previsões realizadas com sucesso!")
-                st.session_state['df_resultados'] = df_resultados
+        with st.spinner("Preparando dados..."):
+            df_for_model, avisos = _prepare_dataframe_for_model(df_raw)
+            for a in avisos:
+                st.warning(a)
 
-            except ValueError as e:
-                st.error(f"❌ **Erro de Validação:** {e}")
-            except Exception as e:
-                st.error("❌ **Ocorreu um erro inesperado durante a previsão.**")
-                st.code(f"Detalhe técnico do erro: {e}")
+            # Conferência de esquema
+            missing_in_model = [c for c in FEATURES_FOR_MODEL if c not in df_for_model.columns]
+            if missing_in_model:
+                st.error(
+                    "Schema inconsistente. Faltam colunas para o modelo: "
+                    + ", ".join(f"`{c}`" for c in missing_in_model)
+                )
+                st.stop()
 
-# --- Exibição e Download dos Resultados ---
-if 'df_resultados' in st.session_state:
-    df_final = st.session_state['df_resultados']
-    
-    st.markdown("---")
-    st.header("Resultados da Previsão")
-    
-    # NOVO: Dashboard com Métricas e Gráficos
-    st.subheader("Dashboard Resumo")
-    
-    # Métricas
-    total_clientes = len(df_final)
-    total_reversao = df_final[df_final['Previsão'] == 'Vai reverter'].shape[0]
-    prob_media = df_final['Probabilidade_numerica'].mean()
+        with st.spinner("Gerando previsões..."):
+            # predict_proba -> prob da classe positiva (índice 1)
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba(df_for_model)[:, 1]
+            else:
+                # fallback raro (alguns modelos não têm proba)
+                # normaliza scores para [0,1] por segurança
+                scores = model.decision_function(df_for_model)
+                proba = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Clientes Analisados", f"{total_clientes}")
-    col2.metric("Previsão de Reversão", f"{total_reversao}", f"{total_reversao / total_clientes:.1%} do total")
-    col3.metric("Probabilidade Média de Reversão", f"{prob_media:.1%}")
+            pred = (proba >= threshold).astype(int)
 
-    # Gráficos
-    col_graf1, col_graf2 = st.columns(2)
-    with col_graf1:
-        st.markdown("##### Distribuição das Previsões")
-        contagem_previsoes = df_final['Previsão'].value_counts().reset_index()
-        contagem_previsoes.columns = ['Previsão', 'Contagem']
-        fig_pie = px.pie(contagem_previsoes, names='Previsão', values='Contagem',
-                         color='Previsão', color_discrete_map={'Vai reverter': '#FF4B4B', 'Não vai reverter': '#00C0F2'})
-        st.plotly_chart(fig_pie, use_container_width=True)
+        df_out = df_raw.copy()
+        df_out["Probabilidade_Reversao"] = np.round(proba, 4)
+        df_out["Predicao"] = np.where(pred == 1, "Vai reverter", "Não vai reverter")
 
-    with col_graf2:
-        st.markdown("##### Distribuição das Probabilidades de Reversão")
-        fig_hist = px.histogram(df_final, x='Probabilidade_numerica', nbins=20,
-                                title='Frequência por Faixa de Probabilidade',
-                                labels={'Probabilidade_numerica': 'Probabilidade de Reversão'})
-        fig_hist.update_layout(yaxis_title='Quantidade de Clientes')
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.success("✅ Previsão concluída!")
 
-    # Tabela de dados detalhados
-    st.subheader("Dados Detalhados")
-    # Exibe a tabela sem a coluna numérica auxiliar
-    st.dataframe(df_final.drop(columns=['Probabilidade_numerica']))
+        # Resumo
+        colA, colB, colC = st.columns(3)
+        total = len(df_out)
+        positivos = int((pred == 1).sum())
+        media_prob = float(np.mean(proba)) if len(proba) else 0.0
+        colA.metric("Registros analisados", f"{total}")
+        colB.metric("Previstos como 'Vai reverter'", f"{positivos}", f"{positivos/total:.1%}")
+        # colC.metric("Probabilidade média (classe 1)", f"{media_prob:.1%}")
 
-    # Download
-    st.subheader("Download dos Resultados")
+        # Checagem: se todas as previsões forem 0, alerta de threshold
+        if positivos == 0:
+            st.warning(
+                "Todas as predições ficaram como **'Não vai reverter'**. "
+                "Considere ajustar o threshold na barra lateral e/ou revisar os dados de entrada."
+            )
 
-    # PREPARA O ARQUIVO EXCEL EM MEMÓRIA
-    output_excel = io.BytesIO()
-    # Usamos o mesmo dataframe final, sem a coluna numérica auxiliar
-    df_to_download = df_final.drop(columns=['Probabilidade_numerica'])
-    with pd.ExcelWriter(output_excel, engine='xlsxwriter') as writer:
-        df_to_download.to_excel(writer, index=False, sheet_name='Previsoes')
-    excel_data = output_excel.getvalue()
+        st.divider()
+        st.subheader("Resultados")
+        st.dataframe(df_out)
 
-    # PREPARA O ARQUIVO CSV EM MEMÓRIA (JÁ EXISTENTE NO SEU CÓDIGO)
-    csv_data = df_to_download.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig')
-
-    # CRIA DUAS COLUNAS PARA OS BOTÕES
-    col1, col2 = st.columns(2)
-    with col1:
+        # Downloads
+        buff_xlsx = io.BytesIO()
+        with pd.ExcelWriter(buff_xlsx, engine="xlsxwriter") as writer:
+            df_out.to_excel(writer, index=False, sheet_name="Previsoes")
         st.download_button(
-            label="📥 Baixar em Excel (.xlsx)",
-            data=excel_data,
-            file_name='previsoes_reversao.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            use_container_width=True
-        )
-    with col2:
-        st.download_button(
-            label="📄 Baixar em CSV (.csv)",
-            data=csv_data,
-            file_name='previsoes_reversao.csv',
-            mime='text/csv',
-            use_container_width=True
+            "📥 Baixar Excel",
+            data=buff_xlsx.getvalue(),
+            file_name="previsoes_reversao.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
         )
 
-st.markdown("---")
-st.write("Desenvolvido com Streamlit. Pela equipe de E&I 🚀")
+        csv_bytes = df_out.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            "📄 Baixar CSV",
+            data=csv_bytes,
+            file_name="previsoes_reversao.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        st.divider()
+        with st.expander("🧪 Debug — Dados enviados ao modelo"):
+            st.write("Features e amostra de linhas após o pré-processamento (exatamente como o modelo espera):")
+            st.write(FEATURES_FOR_MODEL)
+            st.dataframe(df_for_model.head(15))
+
+    except Exception as e:
+        st.error("❌ Erro durante a execução.")
+        st.exception(e)
